@@ -24,39 +24,49 @@ def load_hf_model(model_path: str, device: str) -> Tuple[PaliGemmaForConditional
     with torch.device('meta'):
         model = PaliGemmaForConditionalGeneration(config)
     
+    print("Materializing model in float16...")
+    # Materialize the model directly in float16 to save memory
+    # We need to manually convert each parameter to float16 after to_empty
+    model = model.to_empty(device=device)
+    
+    # Convert all parameters to float16 to match our weight loading
+    # This must be done before loading weights to avoid dtype mismatches
+    for name, param in model.named_parameters():
+        param.data = param.data.half()
+    
     # Find all the *.safetensors files
     safetensors_files = glob.glob(os.path.join(model_path, "*.safetensors"))
     
-    print(f"Loading weights from {len(safetensors_files)} files...")
-    # Load tensors one file at a time to minimize memory usage
-    tensors = {}
+    print(f"Loading weights from {len(safetensors_files)} files directly into model...")
+    # Get the state dict to map parameter names
+    state_dict = model.state_dict()
+    
+    # Load tensors one file at a time and copy directly into model
+    # This avoids keeping two copies in memory
+    missing_keys = set(state_dict.keys())
+    
     for i, safetensors_file in enumerate(safetensors_files):
         print(f"Loading shard {i+1}/{len(safetensors_files)}: {os.path.basename(safetensors_file)}")
         with safe_open(safetensors_file, framework="pt", device="cpu") as f:
             for key in f.keys():
-                tensor = f.get_tensor(key)
-                # Convert to float16 to save memory (reduces model size by ~50%)
-                if tensor.dtype == torch.float32:
-                    tensors[key] = tensor.half()
-                else:
-                    tensors[key] = tensor
+                if key in state_dict:
+                    tensor = f.get_tensor(key)
+                    # Convert to float16 if needed
+                    if tensor.dtype == torch.float32:
+                        tensor = tensor.half()
+                    
+                    # Copy directly into the model's parameter
+                    state_dict[key].copy_(tensor)
+                    missing_keys.discard(key)
+                    
+                    # Free the tensor immediately
+                    del tensor
+        
         # Force garbage collection after each file
         gc.collect()
     
-    print("Materializing model with loaded weights...")
-    # Now materialize the model from meta device with the loaded weights
-    model = model.to_empty(device=device)
-    
-    # Load state dict
-    missing_keys, unexpected_keys = model.load_state_dict(tensors, strict=False)
     if missing_keys:
-        print(f"Warning: Missing keys: {missing_keys[:5]}...")  # Show first 5
-    if unexpected_keys:
-        print(f"Warning: Unexpected keys: {unexpected_keys[:5]}...")  # Show first 5
-    
-    # Clear tensors dict to free memory
-    del tensors
-    gc.collect()
+        print(f"Warning: Missing keys: {list(missing_keys)[:5]}...")  # Show first 5
     
     # Re-initialize buffers that may not have been properly initialized from meta device
     # to_empty() creates uninitialized tensors, so we need to reinitialize position_ids
